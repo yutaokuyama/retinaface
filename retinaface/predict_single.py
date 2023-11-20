@@ -4,6 +4,7 @@ There is a lot of post processing of the predictions.
 from typing import Dict, List, Union
 
 import albumentations as A
+import torchvision.transforms as T
 import numpy as np
 import torch
 from iglovikov_helper_functions.dl.pytorch.utils import tensor_from_rgb_image
@@ -26,7 +27,8 @@ class Model:
             out_channels=256,
         ).to(device)
         self.device = device
-        self.transform = A.Compose([A.LongestMaxSize(max_size=max_size, p=1), A.Normalize(p=1)])
+        self.transform = T.Compose(
+            [T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
         self.max_size = max_size
         self.prior_box = priorbox(
             min_sizes=[[16, 32], [64, 128], [256, 512]],
@@ -43,90 +45,146 @@ class Model:
         self.model.eval()
 
     def predict_jsons(
-        self, image: np.array, confidence_threshold: float = 0.7, nms_threshold: float = 0.4
+        self, image: np.array, confidence_threshold: float = 0.9, nms_threshold: float = 0.4
     ) -> List[Dict[str, Union[List, float]]]:
-        with torch.no_grad():
-            original_height, original_width = image.shape[:2]
+        original_height, original_width = image.shape[:2]
 
-            scale_landmarks = torch.from_numpy(np.tile([self.max_size, self.max_size], 5)).to(self.device)
-            scale_bboxes = torch.from_numpy(np.tile([self.max_size, self.max_size], 2)).to(self.device)
+        scale_landmarks = torch.from_numpy(
+            np.tile([self.max_size, self.max_size], 5)).to(self.device)
+        scale_bboxes = torch.from_numpy(
+            np.tile([self.max_size, self.max_size], 2)).to(self.device)
 
-            transformed_image = self.transform(image=image)["image"]
+        transformed_image = self.transform(image=image)["image"]
 
-            paded = pad_to_size(target_size=(self.max_size, self.max_size), image=transformed_image)
+        paded = pad_to_size(target_size=(
+            self.max_size, self.max_size), image=transformed_image)
 
-            pads = paded["pads"]
+        pads = paded["pads"]
 
-            torched_image = tensor_from_rgb_image(paded["image"]).to(self.device)
+        torched_image = tensor_from_rgb_image(paded["image"]).to(self.device)
 
-            loc, conf, land = self.model(torched_image.unsqueeze(0))
+        loc, conf, land = self.model(torched_image.unsqueeze(0))
 
-            conf = F.softmax(conf, dim=-1)
+        conf = F.softmax(conf, dim=-1)
 
-            annotations: List[Dict[str, Union[List, float]]] = []
+        annotations: List[Dict[str, Union[List, float]]] = []
 
-            boxes = decode(loc.data[0], self.prior_box, self.variance)
+        boxes = decode(loc[0], self.prior_box, self.variance)
 
-            boxes *= scale_bboxes
-            scores = conf[0][:, 1]
+        boxes *= scale_bboxes
+        scores = conf[0][:, 1]
 
-            landmarks = decode_landm(land.data[0], self.prior_box, self.variance)
-            landmarks *= scale_landmarks
+        landmarks = decode_landm(land[0], self.prior_box, self.variance)
+        landmarks *= scale_landmarks
 
-            # ignore low scores
-            valid_index = torch.where(scores > confidence_threshold)[0]
-            boxes = boxes[valid_index]
-            landmarks = landmarks[valid_index]
-            scores = scores[valid_index]
+        # ignore low scores
+        valid_index = torch.where(scores > confidence_threshold)[0]
+        boxes = boxes[valid_index]
+        landmarks = landmarks[valid_index]
+        scores = scores[valid_index]
 
-            # Sort from high to low
-            order = scores.argsort(descending=True)
-            boxes = boxes[order]
-            landmarks = landmarks[order]
-            scores = scores[order]
+        # Sort from high to low
+        order = scores.argsort(descending=True)
+        boxes = boxes[order]
+        landmarks = landmarks[order]
+        scores = scores[order]
 
-            # do NMS
-            keep = nms(boxes, scores, nms_threshold)
-            boxes = boxes[keep, :].int()
+        # do NMS
+        keep = nms(boxes, scores, nms_threshold)
+        boxes = boxes[keep, :].int()
 
-            if boxes.shape[0] == 0:
-                return [{"bbox": [], "score": -1, "landmarks": []}]
+        if boxes.shape[0] == 0:
+            return [{"bbox": [], "score": -1, "landmarks": []}]
 
-            landmarks = landmarks[keep]
+        landmarks = landmarks[keep]
 
-            scores = scores[keep].cpu().numpy().astype(np.float64)
-            boxes = boxes.cpu().numpy()
-            landmarks = landmarks.cpu().numpy()
-            landmarks = landmarks.reshape([-1, 2])
+        scores = scores[keep].cpu().numpy().astype(np.float64)
+        boxes = boxes.cpu().numpy()
+        landmarks = landmarks.cpu().numpy()
+        landmarks = landmarks.reshape([-1, 2])
 
-            unpadded = unpad_from_size(pads, bboxes=boxes, keypoints=landmarks)
+        unpadded = unpad_from_size(pads, bboxes=boxes, keypoints=landmarks)
 
-            resize_coeff = max(original_height, original_width) / self.max_size
+        resize_coeff = max(original_height, original_width) / self.max_size
 
-            boxes = (unpadded["bboxes"] * resize_coeff).astype(int)
-            landmarks = (unpadded["keypoints"].reshape(-1, 10) * resize_coeff).astype(int)
+        boxes = (unpadded["bboxes"] * resize_coeff).astype(int)
+        landmarks = (unpadded["keypoints"].reshape(-1, 10)
+                     * resize_coeff).astype(int)
 
-            for box_id, bbox in enumerate(boxes):
-                x_min, y_min, x_max, y_max = bbox
+        for box_id, bbox in enumerate(boxes):
+            x_min, y_min, x_max, y_max = bbox
 
-                x_min = np.clip(x_min, 0, original_width - 1)
-                x_max = np.clip(x_max, x_min + 1, original_width - 1)
+            x_min = np.clip(x_min, 0, original_width - 1)
+            x_max = np.clip(x_max, x_min + 1, original_width - 1)
 
-                if x_min >= x_max:
-                    continue
+            if x_min >= x_max:
+                continue
 
-                y_min = np.clip(y_min, 0, original_height - 1)
-                y_max = np.clip(y_max, y_min + 1, original_height - 1)
+            y_min = np.clip(y_min, 0, original_height - 1)
+            y_max = np.clip(y_max, y_min + 1, original_height - 1)
 
-                if y_min >= y_max:
-                    continue
+            if y_min >= y_max:
+                continue
 
-                annotations += [
-                    {
-                        "bbox": bbox.tolist(),
-                        "score": scores[box_id],
-                        "landmarks": landmarks[box_id].reshape(-1, 2).tolist(),
-                    }
-                ]
+            annotations += [
+                {
+                    "bbox": bbox.tolist(),
+                    "score": scores[box_id],
+                    "landmarks": landmarks[box_id].reshape(-1, 2).tolist(),
+                }
+            ]
 
-            return annotations
+        return annotations
+
+    def get_landmarks(
+        self, image_tensor: torch.Tensor, confidence_threshold: float = 0.5, nms_threshold: float = 0.5
+    ) -> List[Dict[str, Union[List, float]]]:
+        original_height, original_width = image_tensor.shape[:2]
+
+        scale_landmarks = torch.from_numpy(
+            np.tile([self.max_size, self.max_size], 5)).to(self.device)
+        scale_bboxes = torch.from_numpy(
+            np.tile([self.max_size, self.max_size], 2)).to(self.device)
+
+        transformed_image = self.transform(image_tensor)
+        loc, conf, land = self.model(transformed_image)
+
+        conf = F.softmax(conf, dim=-1)
+
+        boxes = decode(loc[0], self.prior_box, self.variance)
+
+        boxes *= scale_bboxes
+        scores = conf[0][:, 1]
+
+        landmarks = decode_landm(land[0], self.prior_box, self.variance)
+        landmarks *= scale_landmarks
+
+        # ignore low scores
+        valid_index = torch.where(scores > confidence_threshold)[0]
+        boxes = boxes[valid_index]
+        landmarks = landmarks[valid_index]
+        scores = scores[valid_index]
+
+        # Sort from high to low
+        order = scores.argsort(descending=True)
+        boxes = boxes[order]
+        landmarks = landmarks[order]
+        scores = scores[order]
+
+        # do NMS
+        keep = nms(boxes, scores, nms_threshold)
+        boxes = boxes[keep, :].int()
+
+        if boxes.shape[0] == 0:
+            None, None
+
+        landmarks = landmarks[keep]
+
+        scores = scores[keep]
+        boxes = boxes
+        landmarks = landmarks
+        landmarks = landmarks.reshape([-1, 2])
+
+        landmarks = (landmarks.view(-1, 10))
+
+        return landmarks, scores
